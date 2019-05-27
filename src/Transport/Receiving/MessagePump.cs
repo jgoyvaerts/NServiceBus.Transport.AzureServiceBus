@@ -128,7 +128,8 @@
         async Task ProcessMessage(Task<Message> receiveTask)
         {
             Message message = null;
-
+            CancellationTokenSource renewLockCancellationToken = new CancellationTokenSource();
+            Task renewLockCancellationTask = null;
             try
             {
                 // Workaround for ASB MessageReceiver.Receive() that has a timeout and doesn't take a CancellationToken.
@@ -137,6 +138,7 @@
                 Interlocked.Increment(ref numberOfExecutingReceives);
                 message = await receiveTask.ConfigureAwait(false);
 
+                renewLockCancellationTask = RenewLockTask(message, renewLockCancellationToken.Token);
                 circuitBreaker.Success();
             }
             catch (ServiceBusException sbe) when (sbe.IsTransient)
@@ -201,6 +203,8 @@
                     using (var scope = CreateTransactionScope())
                     {
                         await onMessage(messageContext).ConfigureAwait(false);
+                        renewLockCancellationToken.Cancel();
+                        renewLockCancellationTask?.Dispose();
 
                         if (receiveCancellationTokenSource.IsCancellationRequested == false)
                         {
@@ -250,6 +254,11 @@
                     await receiver.SafeAbandonAsync(pushSettings.RequiredTransactionMode, lockToken).ConfigureAwait(false);
                 }
             }
+            finally
+            {
+                renewLockCancellationToken.Cancel();
+                renewLockCancellationTask?.Dispose();
+            }
         }
 
         TransactionScope CreateTransactionScope()
@@ -274,6 +283,18 @@
             }
 
             return transportTransaction;
+        }
+
+        private async Task RenewLockTask(Message message, CancellationToken cancellationToken)
+        {
+            var count = 0;
+            //stop renewing the lock after 20 renews, since at that point we hit a transaction timeout anyway
+            while (cancellationToken.IsCancellationRequested || count > 20)
+            {
+                await Task.Delay(30000).ConfigureAwait(false);
+                await receiver.RenewLockAsync(message).ConfigureAwait(false);
+                count++;
+            }
         }
 
         public async Task Stop()
